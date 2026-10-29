@@ -16,6 +16,8 @@ package posix
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -185,4 +187,45 @@ func newVersionedTestPosix(t *testing.T, mkMeta func(t *testing.T) (meta.Metadat
 		t.Fatalf("new posix: %v", err)
 	}
 	return p
+}
+
+// TestPosixConcurrentDeleteSameKey checks that racing DeleteObject calls on
+// one key all succeed, as the loser of the race finds the key already gone.
+func TestPosixConcurrentDeleteSameKey(t *testing.T) {
+	for name, mkMeta := range metaModes(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			p := newVersionedTestPosix(t, mkMeta)
+			bucket := "bucket"
+			createTestBucket(t, p, bucket)
+
+			const trials, deleters = 200, 4
+			for i := 0; i < trials; i++ {
+				key := fmt.Sprintf("key-%d", i)
+				if _, err := testPut(p, bucket, key, []byte("data"), nil, nil); err != nil {
+					t.Fatalf("put object: %v", err)
+				}
+
+				start := make(chan struct{})
+				errs := make([]error, deleters)
+				var wg sync.WaitGroup
+				for j := 0; j < deleters; j++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						<-start
+						_, errs[j] = p.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: &key})
+					}()
+				}
+				close(start)
+				wg.Wait()
+
+				for _, err := range errs {
+					if err != nil {
+						t.Fatalf("trial %d: concurrent delete failed: %v", i, err)
+					}
+				}
+			}
+		})
+	}
 }
